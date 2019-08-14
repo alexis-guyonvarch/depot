@@ -1,0 +1,555 @@
+---
+title: "DM GLM choix de modele"
+author: "Alexis Guyonvarch"
+date: "29/07/2019"
+output:
+  html_document:
+    highlight: tango
+    theme: cerulean
+    toc: yes
+    number_sections: true
+  pdf_document:
+    toc: yes
+    number_sections: true
+---
+```{r setup, echo = F}
+knitr::opts_chunk$set(warning = F, message = F)
+rm(list=ls())
+
+setwd("~/R/R exercices/MODELE LINEAIRE GENERALISE")
+
+library("corrplot")
+library("ggplot2")
+library("Hmisc")
+library("lattice")
+library("leaps")
+library("lubridate")
+library("knitr")
+library("MASS")
+library("pROC")
+library("ROCR")
+library("tidyverse")
+```
+# __Donnees 'training' et 'test'__
+## *Import*
+
+< Les prédicteurs sont de type entier ou numérique.
+< Le dataframe ne contient pas de données manquantes.
+< En revanche, les variables "minute" et "hour" sont à 0 pour toutes les observations.
+< Dans l'échantillon, le nombre de jours des pluie et de beau temps sont à peu à prés équivalents.
+
+```{r import donnees, echo=F}
+
+train <- read.csv("meteo_train.csv", na.strings = "")
+test <- read.csv("meteo_test.csv", na.strings = "")
+str(train)
+summary(train)
+
+print("Part des jours de pluie")
+prop.table(table(train$pluie.demain))
+```
+## *Preparation*
+
+<Concatenation des 1eres colonnes et conversion au format date.
+```{r manipulation des données}
+#%%%%% Data Train %%%%%#
+train$Day<-ifelse(nchar(as.character(train$Day))==1,paste("0",as.character(train$Day),sep=""),as.character(train$Day))
+train$Month <-
+ifelse(
+nchar(as.character(train$Month)) == 1,
+paste("0", as.character(train$Month), sep = ""),
+as.character(train$Month)
+)
+train$Mois <-
+as.factor(train$Month)# la variable mois est conservée pour la modélisation et transformée en facteur
+train <-
+train %>% unite(col = "Date", Year, Month, Day, sep = "-") %>% dplyr::select(-X, -Hour, -Minute)
+train <- train %>% mutate(Date = ymd(Date))
+#%%%%% Data Test %%%%%#
+test$Day <-
+ifelse(nchar(as.character(test$Day)) == 1,
+paste("0", as.character(test$Day), sep = ""),
+as.character(test$Day))
+test$Month <-
+ifelse(
+nchar(as.character(test$Month)) == 1,
+paste("0", as.character(test$Month), sep = ""),
+as.character(test$Month)
+)
+test$Mois <-
+as.factor(test$Month)# la variable mois est conservée, de type factor, pour la modélisation.
+test <-
+test %>% unite(col = "Date", Year, Month, Day, sep = "-") %>% dplyr::select(-X, -Hour, -Minute)
+test <- test %>% mutate(Date = ymd(Date))
+
+```
+
+# __Exploration donnees__
+## *Nuage de points*
+
+< En première analyse, la pression atmosphérique et la vitesse du vent pourraient nous aider à prédire la survenue de la pluie.
+```{r nuage de points}
+for (i in 2:(ncol(train)-2)){
+  p <- ggplot(data = train, mapping = aes(x = Date , y = train[,i], col=pluie.demain)) +  geom_point() +labs(x = "Date", y = colnames(train[i]))
+  print(p)}
+```
+
+## *Distribution en fonction de la variable cible*
+
+< Au regard de leur distribution, la couverture nuageuse pourrait aussi expliquer la survenue de la pluie. La direction du vent, les rafales de vent ou l'humidité relative pourraient aussi jouer un rôle.
+```{r distribution, echo = T}
+for (i in 2:(ncol(train)-3)){
+  p <- histogram(~train[,i] | pluie.demain, data=train, type = "percent", col="grey", xlab=colnames(train[i]), breaks=10 )
+  q <-ggplot(train, aes(x = train[,i], fill = pluie.demain)) + 
+  labs(title = paste("Distribution de la variable",colnames(train[i]), sep=" "),
+       x = colnames(train[i]), y = "Fréquence",
+       fill = "Couleur",
+       subtitle = "Histogramme de distribution") +
+  geom_density(alpha = 0.4) + # Transparency
+  guides(fill = guide_legend(override.aes = list(alpha = 1)))
+   print(p)
+   print(q)
+}
+rm(p,q,i)
+```
+
+## *Correlation linéaire des variables deux à deux*
+
+< Les coefficients de corrélation sont élevés et positifs entre variables mesurant force du vent et rafales.
+< Les corrélations linéaires sont négatives entre, d'une part, les minutes d'ensoleillement ou le rayonnement solaire et d'autre part, la nébulosité.
+< Il faut s'attendre à des problèmes de colinéarité. 
+```{r corrélations, echo = T}
+mtrain = data.matrix(train[, 2:(ncol(train) - 2)])
+corrplot(
+cor(mtrain),
+type = "lower",
+order = "hclust",
+tl.col = "black",
+tl.srt = 3,
+tl.cex = 0.55
+)
+rm(mtrain)
+```
+## *Echantillonnage pour la validation croisée*
+<Séparation des données avec un booleen
+```{r echantillonnage holdout}
+d <- sample(c(T, F), nrow(train), replace = T, prob = c(.7, .3))
+```
+# __Modélisation, sélection de variables__
+## *Pas à Pas*
+< Aucun des modèles n'est pleinement satisfaisant si l'on s'intéresse au test de significativité globale du modèle. Les modèles sont certes utiles mais ne suffisent pas à capter la variance des observations. Les modèles 2 et 5 restent les plus pertinents.
+< Mais le risque de surrapprentissage des modèles 2,3 et 5 est réel compte tenu du nombre important de variables retenues. L'étape de validation permettra de l'apprécier.
+```{r modelisation pas a pas}
+###############################################################################################################
+#                                                                                                             #
+# Modele 1 : exhaustivité des variables numeriques et modélisation pas à pas progressive avec le critère AIC  #
+#                                                                                                             #
+###############################################################################################################
+predicteurs <- -grep("(Date|pluie.demain)", names(train))
+formule <- as.formula(paste("pluie.demain ~", paste(names(train[, predicteurs]),collapse = "+")))
+
+model1 <- stepAIC(glm(formula=pluie.demain~ 1, data=train[d,], family = binomial(link="logit")),direction="both", scope=list(upper=formule), trace = F)
+summary(model1)
+# Analyse de la déviance
+pchisq(1226.68 - 942.68, 884 - 865, lower = F)
+print("Test du rapport de vraisemblance du modèle nul contre le modèle 1")
+# p-valeur très faible : on rejette le modèle sans covariable. Le modèle est utile.
+print("Test du rapport de vraisemblance du modèle saturé contre le modèle 1")
+pchisq(942.53, 865, lower = F) # La p-valeur est faible.Le modèle doit être amélioré.
+
+###############################################################################################################
+#                                                                                                             #
+# Modele 2 : exhaustivité des variables numeriques et modélisation pas à pas descendante avec le critère AIC  #
+#                                                                                                             #
+###############################################################################################################
+
+model2 <- stepAIC(glm(pluie.demain ~ . -Date, data=train[d,], family = binomial(link="logit")),direction="backward", trace = F)
+summary(model2)
+print("Test du rapport de vraisemblance du modèle saturé contre le modèle 2")
+pchisq(919.25, 859, lower = F)# La p-valeur reste faible (7,5%).Le modèle peut sans doute être amélioré.
+
+###############################################################################################################
+#                                                                                                             #
+#         Modele 3 : Ajout de dummies et modélisation pas à pas descendante avec le critère AIC               #
+#                 variables indicatrices choisies à partir de l'analyse des distributions                     #
+###############################################################################################################
+
+model3 <- stepAIC(glm(pluie.demain ~ . -Date +I(Mean.Sea.Level.Pressure.daily.max..MSL. < 1015) +I(Total.Precipitation.daily.sum..sfc.>1) +I(Snowfall.amount.raw.daily.sum..sfc.> 1 ) + I(Total.Cloud.Cover.daily.mean..sfc.>50) + I(High.Cloud.Cover.daily.mean..high.cld.lay.>15) +I(Sunshine.Duration.daily.sum..sfc.<250)+I(Wind.Direction.daily.mean..10.m.above.gnd.>150)+I(Wind.Speed.daily.mean..900.mb.<15), data=train[d,], family = binomial(link="logit")),direction="backward", trace = F)
+summary(model3)
+print("Test du rapport de vraisemblance du modèle saturé contre le modèle 3")
+pchisq(914.85, 857, lower = F) # La p-valeur - 8,3% - s'améliore un peu. 
+
+###############################################################################################################
+#                                                                                                             #
+#                    Modele 4 : Idem mais modélisation progressive avec le critère AIC                        #
+#                                                                                                             #
+###############################################################################################################
+
+formule4 <- as.formula(paste("pluie.demain ~",paste(names(train[, predicteurs]),collapse = "+"), paste("+Mois+I(Total.Precipitation.daily.sum..sfc.>1) +I(Snowfall.amount.raw.daily.sum..sfc.< 1 ) + I(Total.Cloud.Cover.daily.mean..sfc. >50) + I(High.Cloud.Cover.daily.mean..high.cld.lay. >15) +I(Sunshine.Duration.daily.sum..sfc.<250)+I(Wind.Speed.daily.mean..900.mb.<15)+I(Mean.Sea.Level.Pressure.daily.max..MSL. < 1015)")))
+print("Test du rapport de vraisemblance du modèle saturé contre le modèle 4")
+model4 <- stepAIC(glm(pluie.demain ~ 1, data=train[d,], family = binomial(link="logit")),direction="both", scope=list(upper=formule4), trace = F)
+summary(model4)
+print("Test du rapport de vraisemblance du modèle saturé contre le modèle 4")
+pchisq(942.53,865, lower = F)
+
+###############################################################################################################
+#                                                                                                             #
+#                    Modele 5 : Modélisation descendante avec le critère AIC                                  #
+#                               Ajout d'interactions entre variables                                          #
+###############################################################################################################
+
+model5 <- stepAIC(glm(pluie.demain ~ . - Date + I(Temperature.daily.mean..2.m.above.gnd.^2)+(Wind.Speed.daily.mean..900.mb.^2)+I(Total.Cloud.Cover.daily.mean..sfc.^2)+I(Mean.Sea.Level.Pressure.daily.max..MSL.^2)+I(Total.Precipitation.daily.sum..sfc.^2) +Wind.Speed.daily.mean..900.mb.:Wind.Direction.daily.mean..900.mb.+Relative.Humidity.daily.mean..2.m.above.gnd.:Temperature.daily.mean..2.m.above.gnd.+I(Total.Precipitation.daily.sum..sfc.>1) +I(Snowfall.amount.raw.daily.sum..sfc.< 1 ) + I(Total.Cloud.Cover.daily.mean..sfc. >50) +I(Sunshine.Duration.daily.sum..sfc.<250)+I(Wind.Speed.daily.mean..900.mb.<15)+I(Mean.Sea.Level.Pressure.daily.max..MSL. < 1015), data=train[d,], family = binomial(link="logit")),direction="backward", trace =F)
+summary(model5)
+print("Test du rapport de vraisemblance du modèle saturé contre le modèle 5")
+pchisq(909.75,857, lower = F) #La p-valeur s'améliore. A un seuil de 10%, ce modèle est acceptable.
+
+###############################################################################################################
+#                                                                                                             #
+#                    Modele 6 : Modélisation descendante avec le critère AIC                                  #
+#                   Ajout d'interactions entre variables, et de liaisons quadratiques                         #
+###############################################################################################################
+
+formule6 <- as.formula(paste("pluie.demain ~",paste(names(train[, predicteurs]),collapse = "+"), paste("+Mois++ I(Temperature.daily.mean..2.m.above.gnd.^2)+(Wind.Speed.daily.mean..900.mb.^2)+I(Total.Cloud.Cover.daily.mean..sfc.^2)+I(Mean.Sea.Level.Pressure.daily.max..MSL.^2)+I(Total.Precipitation.daily.sum..sfc.^2) +Wind.Speed.daily.mean..900.mb.:Wind.Direction.daily.mean..900.mb.+Relative.Humidity.daily.mean..2.m.above.gnd.:Temperature.daily.mean..2.m.above.gnd.+I(Total.Precipitation.daily.sum..sfc.>1) +I(Snowfall.amount.raw.daily.sum..sfc.< 1 ) + I(Total.Cloud.Cover.daily.mean..sfc. >50) +I(Sunshine.Duration.daily.sum..sfc.<250)+I(Wind.Speed.daily.mean..900.mb.<15)+I(Mean.Sea.Level.Pressure.daily.max..MSL. < 1015)")))
+
+model6 <- stepAIC(glm(pluie.demain ~ 1 -Mois, data=train[d,], family = binomial(link="logit")),direction="both", scope=list(upper=formule6), trace = F)
+summary(model6)
+print("Test du rapport de vraisemblance du modèle saturé contre le modèle 6")
+pchisq(927.94,862, lower = F) #La p-valeur reste modeste.
+rm(formule, formule4, formule6)
+```
+
+## *Discrétisation des variables ?*
+< Les modèles peuvent sembler insuffisants. Une des voies d'amélioration reside dans la discrétisation des variables numériques.
+< La discrétisation peut constituer une réponse à l'absence de lien non linéaire entre la variable numerique et la variable réponse.
+<Les tests sont peu probants.Pour augmenter le pouvoir prédictif, il serait nécessaire de passer par une fonction automatique de discrétisation s'appyant sur un critère (khi-deux avec la variable discretisee....?).
+```{r discretisation}
+###############################################################################################################
+#                                 Temperature moyenne                                                         #
+###############################################################################################################
+
+q <-quantile(train$Temperature.daily.mean..2.m.above.gnd.,seq(0, 1, by = 0.1))
+tempmoy <-cut(train$Temperature.daily.mean..2.m.above.gnd., q)
+barplot(prop.table(table(tempmoy, train$pluie.demain), 1)[, 2],ylim = c(0, 0.8),las = 3,
+        main = "Temperature.daily.mean..2.m.above.gnd.",ylab = "Jours de pluie",density = 0  )
+abline(h = mean((train$pluie.demain) == T), lty = 2)
+
+#Pas de lien évident avec la variable réponse
+rm(q, tempmoy)
+###############################################################################################################
+#                                 Humidite relative                                                           #
+###############################################################################################################
+q <-quantile(train$Relative.Humidity.daily.mean..2.m.above.gnd.,seq(0, 1, by = 0.1))
+qhumiditemoy.2m <-cut(train$Relative.Humidity.daily.mean..2.m.above.gnd, q)
+  barplot(prop.table(table(qhumiditemoy.2m, train$pluie.demain), 1)[, 2], ylim = c(0, 0.8),
+          las = 3,main = "Relative.Humidity.daily.mean..2.m.above.gnd.",ylab = "Jours de pluie",density = 0)
+abline(h = mean((train$pluie.demain) == T), lty = 2)
+# A nouveau, pas de lien évident avec la variable réponse
+rm(q,qhumiditemoy.2m)
+###############################################################################################################
+#                                 Couverture nuageuse moyenne en pourcentage                                  #
+###############################################################################################################
+q <-quantile(train$Total.Cloud.Cover.daily.mean..sfc.,seq(0, 1, by = 0.1))
+nebulositemoy <-cut(train$Total.Cloud.Cover.daily.mean..sfc., q)
+barplot(prop.table(table(nebulositemoy, train$pluie.demain), 1)[, 2], ylim = c(0, 0.8),
+  las = 3,main = "Total.Cloud.Cover.daily.mean..sfc.",ylab = "Jours de pluie",density = 0)
+abline(h = mean((train$pluie.demain) == T), lty = 2)
+# création d'une nouvelle variable dans la table d'entraînement au seuil de 63%
+train2<-train
+train2$nebulositemoy  =NA
+train2$nebulositemoy[train$Total.Cloud.Cover.daily.mean..sfc.< 63]="Degage ou partiellement couvert"
+train2$nebulositemoy[train$Total.Cloud.Cover.daily.mean..sfc.>=63]="Couvert"
+rm(q,nebulositemoy)
+###############################################################################################################
+#                                 Pression atmospherique au niveau de la mer                                  #
+###############################################################################################################
+q <-quantile(train$Mean.Sea.Level.Pressure.daily.mean..MSL.,seq(0, 1, by = 0.1))
+pressionmoy <-cut(train$Mean.Sea.Level.Pressure.daily.mean..MSL., q)
+barplot(prop.table(table(pressionmoy, train$pluie.demain), 1)[, 2],ylim = c(0, 0.8),las = 3,
+  main = "Mean.Sea.Level.Pressure.daily.mean..MSL.",ylab = "Jours de pluie",density = 0)
+abline(h = mean((train$pluie.demain) == T), lty = 2)
+# création d'une nouvelle variable dans la table d'entraînement au seuil de 1015 hPa
+train2$pressionmoy  =NA
+train2$pressionmoy[train$Mean.Sea.Level.Pressure.daily.mean..MSL.< 1017]="Pression basse et moyenne"
+train2$pressionmoy[train$Mean.Sea.Level.Pressure.daily.mean..MSL.>=1017]="Haute pression"
+rm(q,pressionmoy)
+###############################################################################################################
+#                                         Precipitation moyenne                                                 #
+###############################################################################################################
+q <-select(train,Total.Precipitation.daily.sum..sfc.) %>% filter(Total.Precipitation.daily.sum..sfc.>0) %>%  quantile(train$Total.Precipitation.daily.sum..sfc.,probs=seq(0,1,0.1))
+precipmoy<-cut(train$Total.Precipitation.daily.sum..sfc, q)
+barplot(prop.table(table(precipmoy, train$pluie.demain), 1)[, 2],ylim = c(0, 0.8),las = 3,
+  main = "Total.Precipitation.daily.sum..sfc.", ylab = "Jours de pluie",density = 0)
+abline(h = mean((train$pluie.demain) == T), lty = 2)
+# création d'une nouvelle variable dans la table d'entraînement pour les précipitations moyennes
+train2 <- mutate(train2, precipmoy = case_when(
+                    Total.Precipitation.daily.sum..sfc. ==0  ~ "Precipit. nulle",
+                    Total.Precipitation.daily.sum..sfc. > 0 & Total.Precipitation.daily.sum..sfc. <= 0.2 ~ "Precip. faible",
+                    Total.Precipitation.daily.sum..sfc. > 0.2 ~ "Precip. moy. ou forte"))
+rm(q,precipmoy)
+###############################################################################################################
+#                                         Chute de neige                                                      #
+###############################################################################################################
+q <- quantile(train$Snowfall.amount.raw.daily.sum..sfc.[train$Snowfall.amount.raw.daily.sum..sfc.>0],probs=seq(0,1,0.25))
+neigemoy <-cut(train$Snowfall.amount.raw.daily.sum..sfc., q)
+barplot(prop.table(table(neigemoy, train$pluie.demain), 1)[, 2],ylim = c(0, 1),las = 3,
+  main = "Snowfall.amount.raw.daily.sum..sfc.", ylab = "Jours de pluie",density = 0)
+abline(h = mean((train$pluie.demain) == T), lty = 2)
+# création d'une nouvelle variable dans la table d'entraînement pour les chutes de neige
+train2 <- mutate(train2, neigemoy = case_when(
+                    Snowfall.amount.raw.daily.sum..sfc. ==0  ~ "Pas de neige",
+                    Snowfall.amount.raw.daily.sum..sfc. > 0  ~ "Chute de neige"))
+rm(q,neigemoy)
+###############################################################################################################
+#                                         Temps d'ensoleillement                                              #
+###############################################################################################################
+q <-quantile(train$Sunshine.Duration.daily.sum..sfc.[train$Sunshine.Duration.daily.sum..sfc.>0],probs=seq(0,1,0.1))
+soleilmoy <-cut(train$Sunshine.Duration.daily.sum..sfc., q)
+barplot(prop.table(table(soleilmoy, train$pluie.demain), 1)[, 2],ylim = c(0, 0.8),las = 3,
+  main = "Sunshine.Duration.daily.sum..sfc.", ylab = "Jours de pluie",density = 0)
+abline(h = mean((train$pluie.demain) == T), lty = 2)
+# création d'une nouvelle variable dans la table d'entraînement pour l'ensoleillement
+train2 <- mutate(train2, soleilmoy = case_when(
+                    Sunshine.Duration.daily.sum..sfc. ==0  ~ "Pas d'ensoleillem.",
+                    Sunshine.Duration.daily.sum..sfc. > 0 &  Sunshine.Duration.daily.sum..sfc.<=328 ~ "Peu d'ensoleillem.",
+                    Sunshine.Duration.daily.sum..sfc. > 328  ~ "Ensoleillem."))
+rm(q,soleilmoy)
+###############################################################################################################
+#                                         Rayonnement solaire                                                 #
+###############################################################################################################
+q <-quantile(train$Shortwave.Radiation.daily.sum..sfc.,probs=seq(0,1,0.1))
+rayonmoy <-cut(train$Shortwave.Radiation.daily.sum..sfc., q)
+barplot(prop.table(table(rayonmoy, train$pluie.demain), 1)[, 2],ylim = c(0, 0.8), las = 3,
+  main = "Shortwave.Radiation.daily.sum..sfc.", ylab = "Jours de pluie",density = 0, cex.axis = .5)
+abline(h = mean((train$pluie.demain) == T), lty = 2)
+# création d'une nouvelle variable dans la table d'entraînement pour le rayonnement
+train2 <- mutate(train2, rayonmoy = case_when(
+                    Shortwave.Radiation.daily.sum..sfc.<3182  ~ "Faible rayonnement.",
+                    Shortwave.Radiation.daily.sum..sfc.>= 3182 ~ "Rayonnem. eleve"))
+rm(q,rayonmoy)
+###############################################################################################################
+#                                         Vitesse du vent                                                     #
+############################################################################################################### 
+q <-quantile(train$Wind.Speed.daily.mean..10.m.above.gnd,probs=seq(0,1,0.1))
+ventmoy <-cut(train$Wind.Speed.daily.mean..10.m.above.gnd, q)
+barplot(prop.table(table(ventmoy, train$pluie.demain), 1)[, 2],ylim = c(0, 0.8),las = 3,
+        main = "Wind.Speed.daily.mean..10.m.above.gnd", ylab = "Jours de pluie",density = 0, cex.axis = .5)
+abline(h = mean((train$pluie.demain) == T), lty = 2)
+#Relation linéaire assez clair. La discrétisation ne constitue pas une option pertinente.
+rm(q,ventmoy)
+###############################################################################################################
+#                                       Direction du vent                                                     #
+############################################################################################################### 
+q <-quantile(train$Wind.Direction.daily.mean..10.m.above.gnd.,probs=seq(0,1,0.1))
+directventmoy <-cut(train$Wind.Direction.daily.mean..10.m.above.gnd., q)
+barplot(prop.table(table(directventmoy, train$pluie.demain), 1)[, 2], ylim = c(0, 0.8), las = 3,
+  main = "Wind.Direction.daily.mean..10.m.above.gnd.", ylab = "Jours de pluie",
+  density = 0, cex.axis = .5)
+abline(h = mean((train$pluie.demain) == T), lty = 2)
+# création d'une nouvelle variable dans la table d'entraînement pour la direction du vent
+train2 <- mutate(train2, directventmoy = case_when(
+                    Wind.Direction.daily.mean..10.m.above.gnd.<138  ~ "N-SE",
+                    Wind.Direction.daily.mean..10.m.above.gnd.>= 138 ~ "SE-NO"))
+rm(q,directventmoy)
+###############################################################################################################
+#                                             Modele 7                                                        #
+############################################################################################################### 
+model7 <- step(glm(pluie.demain ~ . 
+                  - Date
+                  - Total.Cloud.Cover.daily.mean..sfc.
+                  - Mean.Sea.Level.Pressure.daily.mean..MSL.
+                  - Total.Precipitation.daily.sum..sfc.
+                  - Sunshine.Duration.daily.sum..sfc.
+                  - Shortwave.Radiation.daily.sum..sfc.
+                  - Wind.Direction.daily.mean..10.m.above.gnd.
+                  + I(Temperature.daily.mean..2.m.above.gnd.^2)
+                  + I(Wind.Speed.daily.mean..900.mb.^2)
+                  + I(Total.Cloud.Cover.daily.mean..sfc.^2)
+                  + I(Mean.Sea.Level.Pressure.daily.max..MSL.^2)
+                  + I(Total.Precipitation.daily.sum..sfc.^2)
+                  + Wind.Speed.daily.mean..900.mb.:Wind.Direction.daily.mean..900.mb.
+                  + Relative.Humidity.daily.mean..2.m.above.gnd.:Temperature.daily.mean..2.m.above.gnd., data=train2[d,],
+                  family = binomial(link="logit")), direction = "backward", trace =F)
+summary(model7)
+print("Test du rapport de vraisemblance du modèle saturé contre le modèle 7")
+pchisq(898.08,853, lower = F)
+# La significativite globale du modèle s'améliore un peu tout comme l'AIC.
+###############################################################################################################
+#                                             Modele 8                                                        #
+############################################################################################################### 
+# Pour pallier les éventuels problèmes de colinéarité entre variables, nous choisissons de calculer les
+# amplitudes entre valeurs minimales et maximales au cours de la journée pour plusieurs variables.
+
+train2$amplitud_temp.2m.gnd<-(train2$Temperature.daily.max..2.m.above.gnd.-train2$Temperature.daily.min..2.m.above.gnd.)
+train2$amplitud_humid.2m.gnd<-(train2$Relative.Humidity.daily.max..2.m.above.gnd.-train2$Relative.Humidity.daily.min..2.m.above.gnd.)
+train2$amplitud_vitesse_vent.10.m<-(train2$Wind.Speed.daily.max..10.m.above.gnd.-train2$Wind.Speed.daily.min..10.m.above.gnd.)
+train2$amplitud_pression<-(train2$Mean.Sea.Level.Pressure.daily.max..MSL. -train2$Mean.Sea.Level.Pressure.daily.min..MSL.)
+train2$amplitud_nebulosite<-(train2$Total.Cloud.Cover.daily.max..sfc. -train2$Total.Cloud.Cover.daily.min..sfc.)
+train2$amplitud_rafale <-(train2$Wind.Gust.daily.max..sfc. -train2$Wind.Gust.daily.min..sfc.)
+
+model8 <- step(glm(pluie.demain ~ . 
+                  - Date
+                  - Total.Cloud.Cover.daily.mean..sfc.
+                  - Mean.Sea.Level.Pressure.daily.mean..MSL.
+                  - Total.Precipitation.daily.sum..sfc.
+                  - Sunshine.Duration.daily.sum..sfc.
+                  - Shortwave.Radiation.daily.sum..sfc.
+                  - Wind.Direction.daily.mean..10.m.above.gnd.
+                  - Wind.Direction.daily.mean..80.m.above.gnd.
+                  - Wind.Direction.daily.mean..900.mb.
+                  - Temperature.daily.max..2.m.above.gnd.-Temperature.daily.min..2.m.above.gnd.
+                  - Relative.Humidity.daily.max..2.m.above.gnd.-Relative.Humidity.daily.min..2.m.above.gnd.
+                  - Wind.Speed.daily.max..10.m.above.gnd.-Wind.Speed.daily.min..10.m.above.gnd.
+                  - Wind.Speed.daily.max..80.m.above.gnd.-Wind.Speed.daily.min..80.m.above.gnd.
+                  - Wind.Speed.daily.max..900.mb.-Wind.Speed.daily.min..900.mb.
+                  - Wind.Speed.daily.mean..80.m.above.gnd.
+                  - Mean.Sea.Level.Pressure.daily.max..MSL.-Mean.Sea.Level.Pressure.daily.min..MSL.
+                  - Total.Cloud.Cover.daily.max..sfc. - Total.Cloud.Cover.daily.min..sfc.
+                  - High.Cloud.Cover.daily.max..high.cld.lay. - High.Cloud.Cover.daily.min..high.cld.lay.
+                  - High.Cloud.Cover.daily.mean..high.cld.lay.
+                  - Medium.Cloud.Cover.daily.max..mid.cld.lay. - Medium.Cloud.Cover.daily.min..mid.cld.lay.
+                  - Medium.Cloud.Cover.daily.mean..mid.cld.lay.
+                  - Low.Cloud.Cover.daily.max..low.cld.lay. -  Low.Cloud.Cover.daily.min..low.cld.lay.
+                  - Low.Cloud.Cover.daily.mean..low.cld.lay.
+                  - Wind.Gust.daily.max..sfc. 
+                  - Wind.Gust.daily.min..sfc.
+                  + I(Temperature.daily.mean..2.m.above.gnd.^2)
+                  + I(Wind.Speed.daily.mean..900.mb.^2)
+                  + I(Total.Cloud.Cover.daily.mean..sfc.^2)
+                  + I(Mean.Sea.Level.Pressure.daily.max..MSL.^2)
+                  + I(Total.Precipitation.daily.sum..sfc.^2)
+                  + Wind.Speed.daily.mean..900.mb.:Wind.Direction.daily.mean..900.mb.
+                  + Relative.Humidity.daily.mean..2.m.above.gnd.:Temperature.daily.mean..2.m.above.gnd., data=train2[d,],
+                  family = binomial(link="logit")), direction = "backward", trace =F)
+summary(model8)
+print("Test du rapport de vraisemblance du modèle saturé contre le modèle 7")
+pchisq(925.23,858, lower = F)
+# Le modéle est juste au dessus du seuil de significativite globale à 5%. Mais il présente l'avantage d'avoir moins, ou peu, de prédicteurs corrélés et d'être en outre plus parcimonieux. 
+```
+
+#__Adequation__
+## *Courbes de ROC*
+
+< Au regard des AUC, relativement proches entre modèles, le modèle 7 présente les meilleurs résultats. 
+```{r courbes de ROC}
+
+###############################################################################################################
+#                               Courbes de ROC des modèles 2, 5, 7 et 8                                       #
+###############################################################################################################
+
+#Courbe de ROC des 4 modèles : 2, 5, 7 et 8
+
+predM2 = predict(model2, newdata = train2[d,], type = "response")
+predM5 = predict(model5, newdata = train2[d,], type = "response")
+predM7 = predict(model7, newdata = train2[d,], type = "response")
+predM8 = predict(model8, newdata = train2[d,], type = "response")
+
+par(pty="s")
+#Modèle 2
+roc(train2$pluie.demain[d],predM2, plot=T, print.auc =T,legacy.axes=T,percent=T, xlab="% faux positifs", ylab = "% vrais positifs")
+#Modèle 5
+roc(train2$pluie.demain[d],predM5, plot=T, print.auc =T,legacy.axes=T,percent=T, xlab="% faux positifs", ylab = "% vrais positifs")
+#Modèle 7
+roc(train2$pluie.demain[d],predM7, plot=T, print.auc =T,legacy.axes=T,percent=T, xlab="% faux positifs", ylab = "% vrais positifs")
+#Modèle 8
+roc(train2$pluie.demain[d],predM8, plot=T, print.auc =T,legacy.axes=T,percent=T, xlab="% faux positifs", ylab = "% vrais positifs")
+
+```
+## *Validation croisée
+
+<Le modèle 7 est prefere au regard des matrices de confusion generees a partir des données de validation. C'est bien entendu cohérent avec les AUC des courbes de ROC observés à l'étape précédente.
+```{r validation croisee hold out}
+# Etape de validation sur les données. Mesurons l'adéquation des différents modèles au seuil qui maximise la précision du modèle
+###############################################################################################################
+#                               Validation croisee pour le modele 5                                           #
+###############################################################################################################
+seuil = seq(0, 1, by=.00001)
+{res = rep(NA, length(seuil))
+for(i in 1:length(seuil)){
+  pred = (predM5 >= seuil[i])
+  res[i]=mean(abs(pred - train2[d, "pluie.demain"]), na.rm = T)
+}
+}
+seuil[which.min(res)]
+#Au seuil de 55%, l'erreur moyenne est minimum (0,27)
+preditM5 = (predM5 >= 0.55)
+print('Matrice de confusion du modèle 5 au seuil de 55 %')
+table("PREDITS" = preditM5, "OBSERVES"=train2$pluie.demain[d])
+mean(abs(preditM5 - train2[d, "pluie.demain"]), na.rm = T)
+#On obtient 74,8% de bonnes prédictions de jours de pluie
+
+###############################################################################################################
+#                               Validation croisee pour le modele 7                                           #
+###############################################################################################################
+seuil = seq(0, 1, by=.00001)
+{res = rep(NA, length(seuil))
+for(i in 1:length(seuil)){
+  pred = (predM7 >= seuil[i])
+  res[i]=mean(abs(pred - train2[d, "pluie.demain"]), na.rm = T)
+}
+}
+seuil[which.min(res)]
+#Au seuil de 47%, l'erreur moyenne est minimum (0,25)
+preditM7 = (predM7 >= 0.47)
+print('Matrice de confusion du modèle 7 au seuil de 47 %')
+table("PREDITS" = preditM7, "OBSERVES"=train2$pluie.demain[d])
+mean(abs(preditM7 - train2[d, "pluie.demain"]), na.rm = T)
+#On obtient 79% de bonnes prédictions de jours de pluie
+
+###############################################################################################################
+#                               Validation croisee pour le modele 8                                           #
+###############################################################################################################
+seuil = seq(0, 1, by=.00001)
+{res = rep(NA, length(seuil))
+for(i in 1:length(seuil)){
+  pred = (predM8 >= seuil[i])
+  res[i]=mean(abs(pred - train2[d, "pluie.demain"]), na.rm = T)
+}
+}
+seuil[which.min(res)]
+#Au seuil de 45%, l'erreur moyenne est minimum (0,26)
+preditM8 = (predM8 >= 0.45)
+print('Matrice de confusion du modèle 8 au seuil de 45 %')
+table("PREDITS" = preditM8, "OBSERVES"=train2$pluie.demain[d])
+mean(abs(preditM8 - train2[d, "pluie.demain"]), na.rm = T)
+#On obtient 81% de bonnes prédictions de jours de pluie. Par contre, est sensiblement dégradé le taux de faux positifs (jours de plui prédits à tort).
+```
+## *Prediction et export de la table
+
+```{r prediction}
+#creation des variables discretisees dans le jeu de donnees TEST
+
+test$nebulositemoy  =NA
+test$nebulositemoy[test$Total.Cloud.Cover.daily.mean..sfc.< 63]="Degage ou partiellement couvert"
+test$nebulositemoy[test$Total.Cloud.Cover.daily.mean..sfc.>=63]="Couvert"
+test$pressionmoy  =NA
+test$pressionmoy[test$Mean.Sea.Level.Pressure.daily.mean..MSL.< 1017]="Pression basse et moyenne"
+test$pressionmoy[test$Mean.Sea.Level.Pressure.daily.mean..MSL.>=1017]="Haute pression"
+test <- mutate(test, precipmoy = case_when(
+                    Total.Precipitation.daily.sum..sfc. ==0  ~ "Precipit. nulle",
+                    Total.Precipitation.daily.sum..sfc. > 0 & Total.Precipitation.daily.sum..sfc. <= 0.2 ~ "Precip. faible",
+                    Total.Precipitation.daily.sum..sfc. > 0.2 ~ "Precip. moy. ou forte"))
+
+test <- mutate(test, neigemoy = case_when(
+                    Snowfall.amount.raw.daily.sum..sfc. ==0  ~ "Pas de neige",
+                    Snowfall.amount.raw.daily.sum..sfc. > 0  ~ "Chute de neige"))
+test <- mutate(test, soleilmoy = case_when(
+                    Sunshine.Duration.daily.sum..sfc. ==0  ~ "Pas d'ensoleillem.",
+                    Sunshine.Duration.daily.sum..sfc. > 0 &  Sunshine.Duration.daily.sum..sfc.<=328 ~ "Peu d'ensoleillem.",
+                    Sunshine.Duration.daily.sum..sfc. > 328  ~ "Ensoleillem."))
+
+test <- mutate(test, rayonmoy = case_when(
+                    Shortwave.Radiation.daily.sum..sfc.<3182  ~ "Faible rayonnement.",
+                    Shortwave.Radiation.daily.sum..sfc.>= 3182 ~ "Rayonnem. eleve"))
+test <- mutate(test, directventmoy = case_when(
+                    Wind.Direction.daily.mean..10.m.above.gnd.<138  ~ "N-SE",
+                    Wind.Direction.daily.mean..10.m.above.gnd.>= 138 ~ "SE-NO"))
+
+#prediction avec le modele 7
+resultat <- predict(model7,test,type = "response")
+resultat <- cbind(test,resultat)
+colnames(resultat)[colnames(resultat)=="resultat"] <- "Proba_estimee"
+resultat$pluie.lendemain<-ifelse(resultat$Proba_estimee>0.47,T,F)
+write.csv(resultat, file = "resultat.csv", row.names =F)
+```
+
+
